@@ -292,7 +292,7 @@ MAX_429_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 
 
-def _request_with_retries(build_request, label: str) -> dict:
+def _request_with_retries(build_request, label: str, max_attempts: int = MAX_ATTEMPTS) -> dict:
     """POST with bounded retries and return the decoded JSON body.
 
     `build_request` is a zero-arg factory rather than a prebuilt Request so
@@ -300,13 +300,17 @@ def _request_with_retries(build_request, label: str) -> dict:
     The policy is backend-agnostic — no retry on 4xx except 429, capped 429
     attempts, exponential backoff on 5xx and network errors — so Whisper and
     Gemini share it and only differ in how they build the request.
+
+    `max_attempts` is lowered by callers that have somewhere better to go than
+    another backoff: the video path rotates to the next model on a 503 rather
+    than waiting out a model that is simply busy.
     """
     context = ssl.create_default_context()
     rate_limit_hits = 0
     last_exc: Exception | None = None
     last_detail = ""
 
-    for attempt in range(MAX_ATTEMPTS):
+    for attempt in range(max_attempts):
         try:
             with urlopen(build_request(), timeout=300, context=context) as response:
                 payload = response.read().decode("utf-8", errors="replace")
@@ -326,21 +330,21 @@ def _request_with_retries(build_request, label: str) -> dict:
             else:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
 
-            if attempt < MAX_ATTEMPTS - 1:
+            if attempt < max_attempts - 1:
                 print(
                     f"[watch] {label} HTTP {exc.code} — retrying in {delay:.1f}s "
-                    f"(attempt {attempt + 2}/{MAX_ATTEMPTS})",
+                    f"(attempt {attempt + 2}/{max_attempts})",
                     file=sys.stderr,
                 )
                 time.sleep(delay)
             continue
         except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as exc:
             last_exc, last_detail = exc, ""
-            if attempt < MAX_ATTEMPTS - 1:
+            if attempt < max_attempts - 1:
                 delay = RETRY_BASE_DELAY * (attempt + 1)
                 print(
                     f"[watch] {label} network error ({type(exc).__name__}: {exc}) — "
-                    f"retrying in {delay:.1f}s (attempt {attempt + 2}/{MAX_ATTEMPTS})",
+                    f"retrying in {delay:.1f}s (attempt {attempt + 2}/{max_attempts})",
                     file=sys.stderr,
                 )
                 time.sleep(delay)
@@ -352,7 +356,7 @@ def _request_with_retries(build_request, label: str) -> dict:
             raise SystemExit(f"{label} returned non-JSON response: {exc}: {payload[:200]}")
 
     raise SystemExit(
-        f"{label} request failed after {MAX_ATTEMPTS} attempts: {last_exc}{last_detail}"
+        f"{label} request failed after {max_attempts} attempts: {last_exc}{last_detail}"
     )
 
 

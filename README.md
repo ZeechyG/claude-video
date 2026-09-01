@@ -64,6 +64,25 @@ Token cost is dominated by frames. Every frame is an image; image tokens add up 
 
 When the user names a moment ("around 2:30", "the last 30 seconds", "from 0:45 to 1:00"), pass `--start` / `--end`. Focused mode gets denser per-second budgets, capped at 2 fps. Far more useful than a sparse pass over the whole thing.
 
+## YouTube without a download
+
+Frames need pixels, which needs a download — and YouTube refuses to serve media to datacenter IPs. On a CI runner, a cloud sandbox, or a remote dev container you get `Sign in to confirm you're not a bot`, and the visual half of the video is gone. Captions still come through; the picture doesn't.
+
+Gemini takes a YouTube URL directly, so it can describe what's on screen with nothing downloaded. `/watch` uses that as a fallback: when a YouTube download fails and `GEMINI_API_KEY` is set, the report grows a **Visual timeline** of timestamped beats instead of frame paths.
+
+```
+[02:23] Top-down view of a sheet of paper with concentric circles and a column of
+        icons along the right edge. A hand draws an asterisk in the central circle.
+[02:32] Hands stick a printed label reading "OFFER" next to the top icon.
+[02:49] On-screen text appears below the presenter: "OFFER OR TARGET MARKET".
+```
+
+Timestamps are absolute source time, and `--start`/`--end` clip it server-side so a focused run doesn't pay for the whole video. Force it with `--youtube-native`; disable it with `--no-youtube-native`.
+
+**The honest caveat: this is Gemini's eyes, not Claude's.** Everywhere else in this skill Claude looks at actual frames. Here it reads a description, and the report says so in the output so the distinction survives into the answer. It's a fallback for when frames are impossible — not a replacement. Where it does beat a transcript is on-screen text: URLs, labels and lower thirds that captions never contain and auto-captions often mangle.
+
+Cost lands in a good place. A 29-minute video ran ~157k video tokens — but those are billed by the Gemini API, and only the ~2k-token digest enters Claude's context. The frame path would have put 50–80k image tokens into that context for sparser coverage.
+
 ## Frame deduplication
 
 Frame selection — keyframes (`efficient`), scene-change detection (`balanced`/`token-burner`), or the uniform sampler it falls back to — can still surface near-identical frames: a screen recording that holds one slide for 90 seconds produces a dozen, each billed as a separate image. A dedup pass drops them before frames reach Claude. It runs by default on every frame mode (`--no-dedup` turns it off):
@@ -202,6 +221,8 @@ Other knobs (passed to `scripts/watch.py`):
 - `--fps F` — override the auto-fps calculation (still capped at 2 fps).
 - `--whisper groq|openai|gemini` — force a specific transcription backend.
 - `--no-whisper` — disable transcription entirely; frames only.
+- `--youtube-native` — YouTube only: get the visual timeline from Gemini by URL instead of downloading frames.
+- `--no-youtube-native` — never fall back to that path.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
 - `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
 
@@ -221,7 +242,8 @@ Other knobs (passed to `scripts/watch.py`):
 │       ├── download.py           # yt-dlp wrapper
 │       ├── frames.py             # ffmpeg frame extraction + auto-fps logic
 │       ├── transcribe.py         # VTT parsing + dedupe + transcription orchestration
-│       ├── whisper.py            # Groq / OpenAI / Gemini clients (pure stdlib)
+│       ├── whisper.py            # Groq / OpenAI / Gemini transcription (pure stdlib)
+│       ├── gemini_video.py       # Gemini native-YouTube visual timeline (pure stdlib)
 │       ├── config.py             # shared config (~/.config/watch/.env)
 │       ├── setup.py              # preflight + installer
 │       └── build-skill.sh        # build dist/watch.skill for claude.ai upload (dev-only)
