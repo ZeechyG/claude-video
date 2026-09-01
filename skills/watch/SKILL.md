@@ -83,7 +83,7 @@ python3 "${SKILL_DIR}/scripts/setup.py"
 
 On macOS with Homebrew, it auto-installs `ffmpeg` and `yt-dlp`. On Linux/Windows, it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
 
-**If an API key is still missing after install:** use `AskUserQuestion` to ask the user whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line. If they don't want to set up Whisper, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
+**If an API key is still missing after install:** use `AskUserQuestion` to ask the user which transcription key they have — Groq (preferred — cheaper, faster), OpenAI, or Gemini. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...`, `OPENAI_API_KEY=...`, or `GEMINI_API_KEY=...` line. If they don't want to set up transcription, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
 
 **First-run watch preference:** after the installer has scaffolded `~/.config/watch/.env`, use `AskUserQuestion` to ask one question:
 
@@ -147,8 +147,8 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
-- `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--whisper groq|openai|gemini` — force a specific transcription backend (default: prefer Groq, then OpenAI, then Gemini)
+- `--no-whisper` — disable the transcription fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
 ### Focusing on a section (higher frame rate)
@@ -184,7 +184,7 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 4 — merge into a timeline, then answer.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` / `whisper (openai)` / `gemini (<model>)` = transcribed by API).
 
 For a narrow factual question ("what does the sign say at 1:02?"), just cite the frame or transcript line that answers it. For anything open-ended — structure, hook, pacing, "what's going on here," "summarize this" — don't answer straight from the two separate streams. Merge them into one timeline first, then read across it:
 
@@ -228,11 +228,18 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
+2. **API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever API has a key configured:
    - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
    - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+   - **Gemini** — `gemini-flash-latest` by default. Tried last. Get a key at aistudio.google.com/apikey.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+All three keys live in `~/.config/watch/.env`. The script prefers Groq, then OpenAI, then Gemini; override with `--whisper groq|openai|gemini`. Use `--no-whisper` to skip the fallback entirely.
+
+**Why Gemini is last.** Groq and OpenAI both run Whisper, which emits segment timestamps as part of its output. Gemini is a general model transcribing audio, so its timestamps are *generated* rather than measured — accurate in practice on clean speech, but Whisper is the safer default when you have both. Pick Gemini deliberately with `--whisper gemini` (e.g. it's the key the user has, or you want its stronger handling of accents and code-switching).
+
+Two Gemini-specific behaviors worth knowing:
+- **Chunking is by duration, not just size.** Gemini writes the transcript as its output, so a long clip overruns the response limit before it ever hits the upload cap. Audio over 10 minutes is split into 10-minute chunks and stitched back into source time. Whisper backends only split at 24 MB.
+- **The model is an alias by default.** `gemini-flash-latest` tracks Google's current flash model. Pinned versions get retired — `gemini-2.5-flash` already returns "no longer available to new users" — which would strand an installed copy of this skill. Override with `GEMINI_MODEL=` in `~/.config/watch/.env` if you need a specific one; note that transcription-specific models like `gemini-3.5-transcribe` do **not** support JSON mode and will fail.
 
 ## Failure modes and handling
 
@@ -240,7 +247,9 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
-- **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
+- **Transcription request fails** → the error is printed to stderr (likely: invalid key or rate limit). Oversized audio is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry on another backend (`--whisper openai`, `--whisper gemini`) if the first one failed.
+- **Gemini returns a 404 naming your model** → the pinned model was retired. The default is the `gemini-flash-latest` alias precisely to avoid this; if `GEMINI_MODEL` is set in `~/.config/watch/.env`, clear it or point it at a current model.
+- **Gemini returns "JSON mode is not enabled for this model"** → `GEMINI_MODEL` names a model without structured-output support (the transcription-specific ones don't have it). Use a general flash/pro model.
 
 ## Token efficiency
 
@@ -258,16 +267,17 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Sends the extracted audio clip to Google's Gemini API (`generativelanguage.googleapis.com/v1beta/models/<model>:generateContent`) when `GEMINI_API_KEY` is set and neither Whisper key is, or when `--whisper gemini` is forced. The audio goes as base64 inside the request body
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, Gemini key only goes to `generativelanguage.googleapis.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + transcription orchestration), `scripts/whisper.py` (Groq / OpenAI / Gemini clients), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.
