@@ -182,11 +182,16 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 3 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript.
 
-**Step 4 — answer the user.** You now have two streams of evidence:
+**Step 4 — merge into a timeline, then answer.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
 - **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
 
-If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
+For a narrow factual question ("what does the sign say at 1:02?"), just cite the frame or transcript line that answers it. For anything open-ended — structure, hook, pacing, "what's going on here," "summarize this" — don't answer straight from the two separate streams. Merge them into one timeline first, then read across it:
+
+1. **Build beats.** Walk the frames and transcript together in chronological order. For each frame (including transcript-cue frames), note a beat: timestamp, what's on screen, what's spoken in the nearest transcript span, and what changed since the last beat. A beat doesn't need both a frame and speech — silence over a frame, or a transcript span with no matching frame, is still a beat; say so rather than skipping it.
+2. **Read across the beats for structure**, not just content: how it opens, what holds attention through the middle, where it turns (a topic change, a cut that isn't just scene noise, a shift in tone), how it closes. That's what separates a summary from a play-by-play.
+3. **Ground every claim in evidence.** Report only what a frame or transcript line actually shows. Label anything you had to infer (reading intent from a visual cue, guessing who's speaking) as **inference**, and flag any moment the sampling could plausibly have missed (a fast cut between two sampled frames, a claim resting on a single frame at a sparse fps) as a **gap** instead of presenting it as certain.
+4. **Close with the three highest-signal observations**, each citing the timestamp(s) it's grounded in.
 
 This holds for `transcript` detail too: even with no frames, produce a **summary** like the other modes — do not paste the full transcript into chat. Synthesize structure, key moments, and spoken content with timestamps; quote only the lines that matter. Offer the raw transcript only if the user explicitly asks for it.
 
