@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Transcribe a video via Groq or OpenAI Whisper API.
+"""Transcribe a video via Groq / OpenAI Whisper, or Google Gemini.
 
 Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
 API has a key. Returns segments in the same shape as transcribe.parse_vtt so
 the rest of the pipeline (filter_range, format_transcript) doesn't care where
 the transcript came from.
 
-Pure stdlib — no `pip install groq` or `pip install openai` needed.
+Groq and OpenAI both expose Whisper behind an identical multipart endpoint
+that returns timestamped segments natively. Gemini is a different shape: it
+takes base64 audio on `generateContent` and returns free-form output, so we
+ask for JSON via a response schema and coerce it into the same segment format.
+
+Pure stdlib — no `pip install groq` / `openai` / `google-genai` needed.
 """
 from __future__ import annotations
 
+import base64
 import io
 import json
 import math
@@ -32,26 +38,58 @@ GROQ_MODEL = "whisper-large-v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
 
+GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+# Deliberately the moving alias, not a pinned version: pinned Gemini models get
+# retired ("no longer available to new users") and would strand installed copies
+# of this skill. Override with GEMINI_MODEL for a specific one.
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
+
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+# Gemini takes audio as base64 inside the JSON request body, and the whole
+# request has to stay under 20 MB. Base64 inflates by 4/3, so the raw mp3 has
+# to be well under 15 MB.
+GEMINI_MAX_UPLOAD_BYTES = 14 * 1024 * 1024
+
+# Gemini is bounded by *output* tokens long before it hits that byte cap: it
+# writes the transcript as JSON, so a 30-minute chunk would overrun the
+# response limit and come back as truncated (unparseable) JSON. 10 minutes of
+# speech lands comfortably inside GEMINI_MAX_OUTPUT_TOKENS.
+GEMINI_MAX_CHUNK_SECONDS = 600.0
+# Stays under the smallest output limit across the Gemini models worth pointing
+# this at (the transcribe-specific ones cap at 32k), and 10 minutes of speech
+# is far short of it either way.
+GEMINI_MAX_OUTPUT_TOKENS = 32768
 
 
 def plan_chunks(
     total_seconds: float,
     total_bytes: int,
     max_bytes: int = MAX_UPLOAD_BYTES,
+    max_seconds: float | None = None,
 ) -> list[tuple[float, float]]:
     """Split a duration into contiguous (offset, duration) chunks under max_bytes.
 
     Size scales linearly with duration (constant-bitrate mono mp3), so an even
     time split yields evenly-sized chunks. Returns a single full-length chunk
     when the audio already fits.
+
+    `max_seconds` adds a second ceiling for backends (Gemini) whose real limit
+    is how much transcript they can emit per call, not how much audio they can
+    ingest. The chunk count is whichever constraint bites harder.
     """
-    if total_bytes <= max_bytes or total_seconds <= 0:
+    fits_bytes = total_bytes <= max_bytes
+    fits_time = max_seconds is None or total_seconds <= max_seconds
+    if (fits_bytes and fits_time) or total_seconds <= 0:
         return [(0.0, total_seconds)]
 
     n = math.ceil(total_bytes / max_bytes)
+    if max_seconds:
+        n = max(n, math.ceil(total_seconds / max_seconds))
     chunk = total_seconds / n
     plan: list[tuple[float, float]] = []
     for i in range(n):
@@ -63,53 +101,73 @@ def plan_chunks(
 
 
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
-    """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
+    """Return (backend, api_key). Prefers Groq, then OpenAI, then Gemini.
 
-    If `preferred` is "groq" or "openai", only that backend's key is considered.
+    Gemini is last in auto-detect order because the Whisper backends return
+    timestamps natively; Gemini's are model-generated. Select it explicitly
+    with `preferred="gemini"` (`--whisper gemini`) to override that.
+
+    If `preferred` is set, only that backend's key is considered.
     """
-    def _from_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        return value.strip() if value else None
-
-    def _from_dotenv(path: Path, name: str) -> str | None:
-        if not path.exists():
-            return None
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() != name:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
-                    value = value[1:-1]
-                return value or None
-        except OSError:
-            return None
-        return None
-
-    dotenv_paths = [
-        Path.home() / ".config" / "watch" / ".env",
-        Path.cwd() / ".env",
-    ]
-
-    candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
+    candidates = (
+        ("GROQ_API_KEY", "groq"),
+        ("OPENAI_API_KEY", "openai"),
+        ("GEMINI_API_KEY", "gemini"),
+    )
     if preferred is not None:
         candidates = tuple(c for c in candidates if c[1] == preferred)
 
     for key_name, backend in candidates:
-        value = _from_env(key_name)
-        if not value:
-            for candidate in dotenv_paths:
-                value = _from_dotenv(candidate, key_name)
-                if value:
-                    break
+        value = read_setting(key_name)
         if value:
             return backend, value
 
     return None, None
+
+
+def _dotenv_paths() -> list[Path]:
+    # Resolved per call, not at import: the cwd .env depends on where /watch ran.
+    return [Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"]
+
+
+def _from_dotenv(path: Path, name: str) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != name:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            return value or None
+    except OSError:
+        return None
+    return None
+
+
+def read_setting(name: str) -> str | None:
+    """Return a setting from the environment, falling back to the .env files.
+
+    Shared by key lookup and GEMINI_MODEL so a value written into
+    ~/.config/watch/.env works the same way for both.
+    """
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    for path in _dotenv_paths():
+        value = _from_dotenv(path, name)
+        if value:
+            return value
+    return None
+
+
+def gemini_model() -> str:
+    return read_setting("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
 
 
 def extract_audio(video_path: str, out_path: Path) -> Path:
@@ -234,6 +292,74 @@ MAX_429_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 
 
+def _request_with_retries(build_request, label: str, max_attempts: int = MAX_ATTEMPTS) -> dict:
+    """POST with bounded retries and return the decoded JSON body.
+
+    `build_request` is a zero-arg factory rather than a prebuilt Request so
+    each attempt gets a fresh one (a Request's body stream can't be replayed).
+    The policy is backend-agnostic — no retry on 4xx except 429, capped 429
+    attempts, exponential backoff on 5xx and network errors — so Whisper and
+    Gemini share it and only differ in how they build the request.
+
+    `max_attempts` is lowered by callers that have somewhere better to go than
+    another backoff: the video path rotates to the next model on a 503 rather
+    than waiting out a model that is simply busy.
+    """
+    context = ssl.create_default_context()
+    rate_limit_hits = 0
+    last_exc: Exception | None = None
+    last_detail = ""
+
+    for attempt in range(max_attempts):
+        try:
+            with urlopen(build_request(), timeout=300, context=context) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = _read_error_body(exc)
+            last_exc, last_detail = exc, detail
+
+            # 4xx other than 429 are client errors — no retry will fix them.
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise SystemExit(f"{label} request failed: {exc}{detail}")
+
+            if exc.code == 429:
+                rate_limit_hits += 1
+                if rate_limit_hits >= MAX_429_RETRIES:
+                    raise SystemExit(f"{label} request failed: {exc}{detail}")
+                delay = _retry_after(exc) or RETRY_BASE_DELAY * (2 ** attempt) + 1
+            else:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+
+            if attempt < max_attempts - 1:
+                print(
+                    f"[watch] {label} HTTP {exc.code} — retrying in {delay:.1f}s "
+                    f"(attempt {attempt + 2}/{max_attempts})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+            continue
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as exc:
+            last_exc, last_detail = exc, ""
+            if attempt < max_attempts - 1:
+                delay = RETRY_BASE_DELAY * (attempt + 1)
+                print(
+                    f"[watch] {label} network error ({type(exc).__name__}: {exc}) — "
+                    f"retrying in {delay:.1f}s (attempt {attempt + 2}/{max_attempts})",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+            continue
+
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{label} returned non-JSON response: {exc}: {payload[:200]}")
+
+    raise SystemExit(
+        f"{label} request failed after {max_attempts} attempts: {last_exc}{last_detail}"
+    )
+
+
 def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> dict:
     fields = {
         "model": model,
@@ -250,60 +376,158 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
         "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
     }
 
-    context = ssl.create_default_context()
-    rate_limit_hits = 0
-    last_exc: Exception | None = None
-    last_detail = ""
-
-    for attempt in range(MAX_ATTEMPTS):
-        request = Request(endpoint, data=body, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=300, context=context) as response:
-                payload = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = _read_error_body(exc)
-            last_exc, last_detail = exc, detail
-
-            # 4xx other than 429 are client errors — no retry will fix them.
-            if 400 <= exc.code < 500 and exc.code != 429:
-                raise SystemExit(f"Whisper request failed: {exc}{detail}")
-
-            if exc.code == 429:
-                rate_limit_hits += 1
-                if rate_limit_hits >= MAX_429_RETRIES:
-                    raise SystemExit(f"Whisper request failed: {exc}{detail}")
-                delay = _retry_after(exc) or RETRY_BASE_DELAY * (2 ** attempt) + 1
-            else:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-
-            if attempt < MAX_ATTEMPTS - 1:
-                print(
-                    f"[watch] whisper HTTP {exc.code} — retrying in {delay:.1f}s "
-                    f"(attempt {attempt + 2}/{MAX_ATTEMPTS})",
-                    file=sys.stderr,
-                )
-                time.sleep(delay)
-            continue
-        except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as exc:
-            last_exc, last_detail = exc, ""
-            if attempt < MAX_ATTEMPTS - 1:
-                delay = RETRY_BASE_DELAY * (attempt + 1)
-                print(
-                    f"[watch] whisper network error ({type(exc).__name__}: {exc}) — "
-                    f"retrying in {delay:.1f}s (attempt {attempt + 2}/{MAX_ATTEMPTS})",
-                    file=sys.stderr,
-                )
-                time.sleep(delay)
-            continue
-
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"Whisper returned non-JSON response: {exc}: {payload[:200]}")
-
-    raise SystemExit(
-        f"Whisper request failed after {MAX_ATTEMPTS} attempts: {last_exc}{last_detail}"
+    return _request_with_retries(
+        lambda: Request(endpoint, data=body, headers=headers, method="POST"),
+        "whisper",
     )
+
+
+GEMINI_PROMPT = (
+    "Transcribe this audio verbatim.\n\n"
+    "Return every spoken word, in the language spoken — do not translate, "
+    "summarize, censor, or add commentary, headings, or speaker labels that "
+    "are not audible. If a passage is unintelligible, transcribe what you can "
+    "and leave the rest out rather than guessing.\n\n"
+    "Break the transcript into consecutive segments of roughly 3-8 seconds, "
+    "split at natural sentence or clause boundaries. Segments must be in "
+    "chronological order and must not overlap.\n\n"
+    "`start` and `end` are seconds measured from the beginning of THIS audio "
+    "clip (the clip starts at 0), as numbers — not clock times, and not "
+    "offsets into any larger recording.\n\n"
+    "If the audio contains no intelligible speech, return an empty array."
+)
+
+# Structured output: without a schema Gemini narrates ("Here is the
+# transcript...") and the timestamps drift into MM:SS strings. Pinning the
+# shape is what makes the response parseable instead of prose.
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "start": {"type": "NUMBER"},
+            "end": {"type": "NUMBER"},
+            "text": {"type": "STRING"},
+        },
+        "required": ["start", "end", "text"],
+    },
+}
+
+
+def _post_gemini(api_key: str, model: str, audio_path: Path) -> dict:
+    """Send one audio clip to generateContent and return the raw response."""
+    mimetype = mimetypes.guess_type(audio_path.name)[0] or "audio/mpeg"
+    payload: dict = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": GEMINI_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": mimetype,
+                            "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_RESPONSE_SCHEMA,
+            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+        },
+    }
+
+    # No thinkingConfig here on purpose: the knob is spelled differently across
+    # Gemini generations (thinkingBudget vs thinking_level) and sending the
+    # wrong one is a 400. GEMINI_MODEL can point at any of them, so we stay on
+    # the subset of generationConfig every generation accepts.
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+        "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
+    }
+    endpoint = GEMINI_ENDPOINT.format(model=model)
+
+    return _request_with_retries(
+        lambda: Request(endpoint, data=body, headers=headers, method="POST"),
+        "gemini",
+    )
+
+
+def _coerce_seconds(value) -> float:
+    """Accept a number of seconds, or a "MM:SS"/"HH:MM:SS" string, as seconds.
+
+    The schema asks for a number, but models still occasionally emit clock
+    strings; parsing both is cheaper than losing a whole chunk to a ValueError.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0.0
+        if ":" in text:
+            seconds = 0.0
+            for part in text.split(":"):
+                seconds = seconds * 60 + float(part or 0)
+            return seconds
+        return float(text)
+    return 0.0
+
+
+def _segments_from_gemini(data: dict) -> list[dict]:
+    """Convert a generateContent response into {start, end, text} segments."""
+    candidates = data.get("candidates") or []
+    if not candidates:
+        # No candidate at all usually means the prompt itself was blocked.
+        feedback = (data.get("promptFeedback") or {}).get("blockReason")
+        raise SystemExit(
+            f"Gemini returned no candidates{f' (blocked: {feedback})' if feedback else ''}"
+        )
+
+    candidate = candidates[0]
+    finish = candidate.get("finishReason")
+    parts = ((candidate.get("content") or {}).get("parts")) or []
+    raw = "".join(part.get("text") or "" for part in parts).strip()
+
+    if not raw:
+        if finish and finish != "STOP":
+            raise SystemExit(f"Gemini returned no transcript (finishReason: {finish})")
+        return []
+
+    if finish == "MAX_TOKENS":
+        raise SystemExit(
+            "Gemini hit its output limit mid-transcript — the response is "
+            "truncated. Re-run with a shorter --start/--end window."
+        )
+
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Gemini returned unparseable JSON: {exc}: {raw[:200]}")
+
+    if not isinstance(items, list):
+        raise SystemExit(f"Gemini returned {type(items).__name__}, expected a list of segments")
+
+    out: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        start = _coerce_seconds(item.get("start"))
+        end = _coerce_seconds(item.get("end"))
+        # A model can emit end < start on a bad split; clamping keeps the
+        # downstream range filter from silently dropping the segment.
+        if end < start:
+            end = start
+        out.append({"start": round(start, 2), "end": round(end, 2), "text": text})
+
+    return out
 
 
 def _read_error_body(exc: urllib.error.HTTPError) -> str:
@@ -396,19 +620,28 @@ def transcribe_chunks(
         )
 
     if failures == len(chunks):
-        raise SystemExit("Whisper failed on every audio chunk")
+        raise SystemExit("transcription failed on every audio chunk")
     return segments
+
+
+def upload_limits(backend: str) -> tuple[int, float | None]:
+    """Return (max_bytes, max_seconds) for one backend's per-request payload."""
+    if backend == "gemini":
+        return GEMINI_MAX_UPLOAD_BYTES, GEMINI_MAX_CHUNK_SECONDS
+    return MAX_UPLOAD_BYTES, None
 
 
 def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]:
     """Upload one audio file and return its 0-based segments."""
     if backend == "groq":
-        response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-    elif backend == "openai":
-        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
-    else:
-        raise SystemExit(f"Unknown whisper backend: {backend}")
-    return _segments_from_response(response)
+        return _segments_from_response(_post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path))
+    if backend == "openai":
+        return _segments_from_response(
+            _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+        )
+    if backend == "gemini":
+        return _segments_from_gemini(_post_gemini(api_key, gemini_model(), audio_path))
+    raise SystemExit(f"Unknown transcription backend: {backend}")
 
 
 def transcribe_video(
@@ -429,37 +662,49 @@ def transcribe_video(
     if not backend or not api_key:
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
-            f"Run `python3 {setup_py}` to configure."
+            "No transcription API key available. Set GROQ_API_KEY (preferred), "
+            "OPENAI_API_KEY, or GEMINI_API_KEY in the environment or in "
+            f"~/.config/watch/.env. Run `python3 {setup_py}` to configure."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
+    print(f"[watch] extracting audio for transcription ({backend})…", file=sys.stderr)
     audio_path = extract_audio(video_path, audio_out)
     audio_bytes = audio_path.stat().st_size
+    max_bytes, max_seconds = upload_limits(backend)
 
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    # Gemini is capped by clip length as well as size, so its duration has to
+    # be known up front rather than only after a size overrun.
+    duration = audio_duration(audio_path) if max_seconds else 0.0
+    within_limits = audio_bytes <= max_bytes and (max_seconds is None or duration <= max_seconds)
+
+    if within_limits:
         print(
-            f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
+            f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend}…",
             file=sys.stderr,
         )
         segments = transcribe_one(audio_path)
     else:
-        duration = audio_duration(audio_path)
-        plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
+        if not duration:
+            duration = audio_duration(audio_path)
+        plan = plan_chunks(duration, audio_bytes, max_bytes, max_seconds)
+        reason = (
+            f"{audio_bytes / (1024 * 1024):.0f} MB exceeds {max_bytes // (1024 * 1024)} MB"
+            if audio_bytes > max_bytes
+            else f"{duration / 60:.0f} min exceeds the {max_seconds / 60:.0f} min "
+                 f"per-request limit for {backend}"
+        )
         print(
-            f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            f"[watch] audio: {reason} — splitting into {len(plan)} chunks…",
             file=sys.stderr,
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
         segments = transcribe_chunks(chunks, transcribe_one)
 
     if not segments:
-        raise SystemExit("Whisper returned no transcript segments")
+        raise SystemExit(f"{backend} returned no transcript segments")
 
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
     return segments, backend
@@ -467,7 +712,10 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print(
+            "usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai|gemini]",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     video = sys.argv[1]

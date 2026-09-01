@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.2.0"
+version: "0.3.0"
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -83,7 +83,7 @@ python3 "${SKILL_DIR}/scripts/setup.py"
 
 On macOS with Homebrew, it auto-installs `ffmpeg` and `yt-dlp`. On Linux/Windows, it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
 
-**If an API key is still missing after install:** use `AskUserQuestion` to ask the user whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line. If they don't want to set up Whisper, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
+**If an API key is still missing after install:** use `AskUserQuestion` to ask the user which transcription key they have — Groq (preferred — cheaper, faster), OpenAI, or Gemini. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...`, `OPENAI_API_KEY=...`, or `GEMINI_API_KEY=...` line. If they don't want to set up transcription, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
 
 **First-run watch preference:** after the installer has scaffolded `~/.config/watch/.env`, use `AskUserQuestion` to ask one question:
 
@@ -147,8 +147,10 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
-- `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--whisper groq|openai|gemini` — force a specific transcription backend (default: prefer Groq, then OpenAI, then Gemini)
+- `--no-whisper` — disable the transcription fallback entirely (frames-only if no captions)
+- `--youtube-native` — for a YouTube URL, get the visual timeline from Gemini by URL instead of downloading and extracting frames. Needs `GEMINI_API_KEY`. See "YouTube without a download" below — **the visuals are described by Gemini, not seen by you.**
+- `--no-youtube-native` — never fall back to that path; a blocked download stays a hard failure
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
 ### Focusing on a section (higher frame rate)
@@ -182,11 +184,18 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 
 **Step 3 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript.
 
-**Step 4 — answer the user.** You now have two streams of evidence:
+**Step 4 — merge into a timeline, then answer.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` / `whisper (openai)` / `gemini (<model>)` = transcribed by API).
 
-If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
+A third stream appears only when the video could not be downloaded: a **## Visual timeline** of beats Gemini described by URL. It substitutes for frames, at lower confidence — merge it into the timeline the same way, but attribute it ("Gemini's description reports…") and treat a claim resting on it alone as weaker than one a frame would support. See "YouTube without a download."
+
+For a narrow factual question ("what does the sign say at 1:02?"), just cite the frame or transcript line that answers it. For anything open-ended — structure, hook, pacing, "what's going on here," "summarize this" — don't answer straight from the two separate streams. Merge them into one timeline first, then read across it:
+
+1. **Build beats.** Walk the frames and transcript together in chronological order. For each frame (including transcript-cue frames), note a beat: timestamp, what's on screen, what's spoken in the nearest transcript span, and what changed since the last beat. A beat doesn't need both a frame and speech — silence over a frame, or a transcript span with no matching frame, is still a beat; say so rather than skipping it.
+2. **Read across the beats for structure**, not just content: how it opens, what holds attention through the middle, where it turns (a topic change, a cut that isn't just scene noise, a shift in tone), how it closes. That's what separates a summary from a play-by-play.
+3. **Ground every claim in evidence.** Report only what a frame or transcript line actually shows. Label anything you had to infer (reading intent from a visual cue, guessing who's speaking) as **inference**, and flag any moment the sampling could plausibly have missed (a fast cut between two sampled frames, a claim resting on a single frame at a sparse fps) as a **gap** instead of presenting it as certain.
+4. **Close with the three highest-signal observations**, each citing the timestamp(s) it's grounded in.
 
 This holds for `transcript` detail too: even with no frames, produce a **summary** like the other modes — do not paste the full transcript into chat. Synthesize structure, key moments, and spoken content with timestamps; quote only the lines that matter. Offer the raw transcript only if the user explicitly asks for it.
 
@@ -203,6 +212,25 @@ At `transcript` detail, captions are enough to return a report without downloadi
 At `efficient` detail, the script downloads the video and extracts **keyframes only** (`ffmpeg -skip_frame nokey`) — a near-instant pass that lands frames on scene cuts. If a clip has fewer than 4 keyframes it falls back to uniform sampling.
 
 At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling only when the video is effectively static. `balanced` caps at 100 frames; `token-burner` is uncapped. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height for Claude Read compatibility.
+
+## YouTube without a download
+
+Frames need pixels, which needs a download. YouTube refuses to serve media to datacenter IPs — CI runners, cloud sandboxes, and remote dev containers get a "Sign in to confirm you're not a bot" check — so on those machines the visual half of the timeline is simply unavailable.
+
+Gemini accepts a YouTube URL directly (`file_data`/`file_uri`), so it can describe what is on screen without anything being downloaded. That restores the visual channel where frames are impossible.
+
+When it runs:
+- **Automatically**, when a YouTube download fails and `GEMINI_API_KEY` is set. The report says so on the **Frames** line.
+- **On request**, with `--youtube-native`, even when the download would have worked.
+- **Never**, with `--no-youtube-native`.
+
+The report gains a **## Visual timeline** section of `[MM:SS] description` beats in absolute source time, and `--start`/`--end` clip it server-side so a focused run doesn't pay for the whole video.
+
+**Treat these beats as secondhand.** This is the one place in this skill where you have not seen the video — Gemini looked, and you are reading its notes. So:
+- Attribute it. "Gemini's description says the diagram is concentric rings," not "the diagram is concentric rings."
+- It is evidence, but weaker than a frame. It can miss a cut, and it can be confidently wrong about something a frame would have settled.
+- Prefer frames whenever a download works. Do not reach for `--youtube-native` to save time on a video you could actually fetch.
+- On-screen text is where it earns its keep — URLs, labels, and lower thirds that a transcript never contains, and that garbled auto-captions often mangle.
 
 ## Transcript-cue frames
 
@@ -223,19 +251,29 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
+2. **API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever API has a key configured:
    - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
    - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+   - **Gemini** — `gemini-flash-latest` by default. Tried last. Get a key at aistudio.google.com/apikey.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+All three keys live in `~/.config/watch/.env`. The script prefers Groq, then OpenAI, then Gemini; override with `--whisper groq|openai|gemini`. Use `--no-whisper` to skip the fallback entirely.
+
+**Why Gemini is last.** Groq and OpenAI both run Whisper, which emits segment timestamps as part of its output. Gemini is a general model transcribing audio, so its timestamps are *generated* rather than measured — accurate in practice on clean speech, but Whisper is the safer default when you have both. Pick Gemini deliberately with `--whisper gemini` (e.g. it's the key the user has, or you want its stronger handling of accents and code-switching).
+
+Two Gemini-specific behaviors worth knowing:
+- **Chunking is by duration, not just size.** Gemini writes the transcript as its output, so a long clip overruns the response limit before it ever hits the upload cap. Audio over 10 minutes is split into 10-minute chunks and stitched back into source time. Whisper backends only split at 24 MB.
+- **The model is an alias by default.** `gemini-flash-latest` tracks Google's current flash model. Pinned versions get retired — `gemini-2.5-flash` already returns "no longer available to new users" — which would strand an installed copy of this skill. Override with `GEMINI_MODEL=` in `~/.config/watch/.env` if you need a specific one; note that transcription-specific models like `gemini-3.5-transcribe` do **not** support JSON mode and will fail.
 
 ## Failure modes and handling
 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
-- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
-- **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
+- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying. For a **YouTube** URL with `GEMINI_API_KEY` set, the script falls back to the described visual timeline automatically (see "YouTube without a download") — say that frames were unavailable and the visuals are Gemini's description.
+- **"Sign in to confirm you're not a bot"** → YouTube is refusing this machine's IP, which is normal on cloud/CI boxes. Nothing to retry and nothing to work around: either run from a machine with a residential connection, or use the Gemini path for the visuals.
+- **Transcription request fails** → the error is printed to stderr (likely: invalid key or rate limit). Oversized audio is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry on another backend (`--whisper openai`, `--whisper gemini`) if the first one failed.
+- **Gemini returns a 404 naming your model** → the pinned model was retired. The default is the `gemini-flash-latest` alias precisely to avoid this; if `GEMINI_MODEL` is set in `~/.config/watch/.env`, clear it or point it at a current model.
+- **Gemini returns "JSON mode is not enabled for this model"** → `GEMINI_MODEL` names a model without structured-output support (the transcription-specific ones don't have it). Use a general flash/pro model.
 
 ## Token efficiency
 
@@ -253,16 +291,18 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Sends the extracted audio clip to Google's Gemini API (`generativelanguage.googleapis.com/v1beta/models/<model>:generateContent`) when `GEMINI_API_KEY` is set and neither Whisper key is, or when `--whisper gemini` is forced. The audio goes as base64 inside the request body
+- Sends the **video's URL** (canonicalized to `youtube.com/watch?v=<id>`, tracking parameters stripped) to Gemini when the YouTube-native path runs, so Gemini can read the video from YouTube directly. No video or audio bytes leave this machine on that path — only the URL
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, Gemini key only goes to `generativelanguage.googleapis.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
 
-**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
+**Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + transcription orchestration), `scripts/whisper.py` (Groq / OpenAI / Gemini transcription clients), `scripts/gemini_video.py` (Gemini native-YouTube visual timeline), `scripts/setup.py` (preflight + installer)
 
 Review scripts before first use to verify behavior.

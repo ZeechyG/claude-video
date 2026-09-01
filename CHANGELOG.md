@@ -2,6 +2,19 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.0] — 2026-09-01
+
+### Added
+- **Gemini as a third transcription backend.** Set `GEMINI_API_KEY` in `~/.config/watch/.env`, or force it with `--whisper gemini`. Groq and OpenAI both run Whisper, which reports segment timestamps natively; Gemini is a general model asked to transcribe, so its timestamps are model-generated — it is tried last, and the auto-detect result for an existing Groq or OpenAI user is unchanged. Chunks by duration as well as size (over 10 minutes splits and stitches back into source time), because the transcript is Gemini's *output* and a long clip overruns the response limit long before the upload cap. Defaults to the `gemini-flash-latest` alias rather than a pinned version, since pinned models get retired.
+- **Gemini's native YouTube path** for the visual timeline (`--youtube-native`, `--no-youtube-native`). YouTube refuses to serve media to datacenter IPs, so on CI runners and cloud sandboxes frames are impossible. Gemini takes a YouTube URL directly, so it can describe what is on screen with nothing downloaded — the report grows a **Visual timeline** of timestamped beats. Runs automatically when a YouTube download fails and a Gemini key is set. `--start`/`--end` clip it server-side. The visuals are Gemini's description rather than frames Claude looked at, and the report says so in its own output so the distinction survives into the answer; frames remain preferred whenever a download works.
+- **Timeline-synthesis method in `SKILL.md` Step 4.** Frames and transcript are merged into beats (timestamp, what's on screen, what's spoken, what changed) and read across for structure — how it opens, what holds attention, where it turns, how it closes — with inferences and sampling gaps labelled as such, closing on the three highest-signal observations with timestamps.
+
+### Changed
+- The transcript source is reported as `gemini (<model>)` rather than `whisper (gemini)`, which misnamed the model that produced it.
+- Retry policy (no retry on 4xx except 429, capped 429 attempts, backoff on 5xx and network errors) is shared by every backend instead of living inside the Whisper client. The video path additionally rotates models: an alias that is busy (503) or a pin that has been retired (404) moves to the next rather than failing the run.
+- User-facing wording says "transcription" where it used to say "Whisper", now that not every backend is Whisper.
+- `GEMINI_MODEL` resolves through the same environment-then-`.env` path as the API keys, so the line the installer scaffolds is actually read.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

@@ -19,7 +19,12 @@ from config import frame_cap, get_config  # noqa: E402
 from download import download, fetch_captions, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import gemini_model, load_api_key, read_setting, transcribe_video  # noqa: E402
+from gemini_video import (  # noqa: E402
+    fetch_visual_timeline,
+    format_beats,
+    is_youtube_url,
+)
 
 
 def main() -> int:
@@ -52,13 +57,33 @@ def main() -> int:
     ap.add_argument(
         "--no-whisper",
         action="store_true",
-        help="Disable Whisper fallback. Report frames-only if no captions available.",
+        help="Disable the transcription fallback. Report frames-only if no captions available.",
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "gemini"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help=(
+            "Force a specific transcription backend. "
+            "Default: prefer Groq, then OpenAI, then Gemini."
+        ),
+    )
+    ap.add_argument(
+        "--youtube-native",
+        action="store_true",
+        help=(
+            "For a YouTube URL, get the visual timeline from Gemini by URL instead of "
+            "downloading and extracting frames. Needs GEMINI_API_KEY. Note: the visuals "
+            "are then described by Gemini, not seen by Claude."
+        ),
+    )
+    ap.add_argument(
+        "--no-youtube-native",
+        action="store_true",
+        help=(
+            "Never fall back to Gemini's YouTube path. A blocked download stays a "
+            "hard failure instead of degrading to a described timeline."
+        ),
     )
     ap.add_argument(
         "--no-dedup",
@@ -106,10 +131,26 @@ def main() -> int:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
 
+    # Gemini's YouTube path needs a key and a YouTube URL; it is opt-in up front
+    # and a last resort when the download is refused.
+    gemini_key = read_setting("GEMINI_API_KEY")
+    youtube_native_possible = (
+        url_source and is_youtube_url(args.source) and bool(gemini_key)
+        and not args.no_youtube_native
+    )
+    youtube_native = args.youtube_native and youtube_native_possible
+    if args.youtube_native and not youtube_native:
+        reason = (
+            "--no-youtube-native was also set" if args.no_youtube_native
+            else "GEMINI_API_KEY is not set" if not gemini_key
+            else "the source is not a YouTube URL"
+        )
+        raise SystemExit(f"--youtube-native cannot be used here: {reason}")
+
     # --timestamps needs the video for frame grabs, so it overrides the
     # transcript-mode download skip (and forces a full, not audio-only, fetch).
     audio_only = detail == "transcript" and not cue_timestamps
-    if detail == "transcript" and transcript_segments and not cue_timestamps:
+    if youtube_native or (detail == "transcript" and transcript_segments and not cue_timestamps):
         video_path = None
     else:
         if url_source:
@@ -118,15 +159,29 @@ def main() -> int:
                 else "[watch] downloading video via yt-dlp…",
                 file=sys.stderr,
             )
-            dl = download(
-                args.source,
-                work / "download",
-                audio_only=audio_only,
-            )
+            try:
+                dl = download(
+                    args.source,
+                    work / "download",
+                    audio_only=audio_only,
+                )
+            except SystemExit as exc:
+                # A YouTube download refused (bot check / 403) still has one route
+                # to the visuals left; anything else is a genuine failure.
+                if not youtube_native_possible:
+                    raise
+                print(
+                    f"[watch] download failed ({exc}) — falling back to Gemini's "
+                    "YouTube path for the visual timeline",
+                    file=sys.stderr,
+                )
+                youtube_native = True
+                video_path = None
         else:
             print("[watch] using local file…", file=sys.stderr)
             dl = download(args.source, work / "download")
-        video_path = dl["video_path"]
+        if not youtube_native:
+            video_path = dl["video_path"]
 
     meta = get_metadata(video_path) if video_path else {
         "duration_seconds": float((dl.get("info") or {}).get("duration") or 0),
@@ -248,20 +303,47 @@ def main() -> int:
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = f"whisper ({used_backend})"
+                # Gemini isn't Whisper — labelling it "whisper (gemini)" would
+                # misreport which model produced the transcript.
+                transcript_source = (
+                    f"gemini ({gemini_model()})"
+                    if used_backend == "gemini"
+                    else f"whisper ({used_backend})"
+                )
             except SystemExit as exc:
-                print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
+                print(f"[watch] transcription fallback failed: {exc}", file=sys.stderr)
         else:
             hint = (
                 f"--whisper {args.whisper} was set but the matching API key is missing"
                 if args.whisper else
-                "no subtitles and no Whisper API key found"
+                "no subtitles and no transcription API key found"
             )
             setup_py = SCRIPT_DIR / "setup.py"
             print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                f"[watch] {hint} — run `python3 {setup_py}` to enable the transcription fallback",
                 file=sys.stderr,
             )
+
+    visual_beats: list[dict] = []
+    visual_model: str | None = None
+    visual_tokens = 0
+    if youtube_native:
+        window = f"{format_time(effective_start)}-{format_time(effective_end)}" if focused else "full video"
+        print(f"[watch] asking Gemini to describe the video ({window})…", file=sys.stderr)
+        try:
+            visual_beats, visual_model, visual_tokens = fetch_visual_timeline(
+                args.source,
+                gemini_key,
+                start_seconds=start_sec,
+                end_seconds=end_sec,
+            )
+            print(
+                f"[watch] {len(visual_beats)} visual beats via {visual_model} "
+                f"({visual_tokens} tokens billed to Gemini)",
+                file=sys.stderr,
+            )
+        except SystemExit as exc:
+            print(f"[watch] Gemini video analysis failed: {exc}", file=sys.stderr)
     elif not transcript_segments and video_path and not meta.get("has_audio"):
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
 
@@ -286,7 +368,12 @@ def main() -> int:
     range_mode = "focused" if focused else "full"
     print(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
-    if detail != "transcript":
+    if youtube_native:
+        print(
+            f"- **Frames:** none — visual timeline from Gemini "
+            f"({visual_model or 'unavailable'}), no download"
+        )
+    elif detail != "transcript":
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
@@ -323,7 +410,14 @@ def main() -> int:
             "This may use a large number of image tokens."
         )
 
-    if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
+    # The sparse-scan warning is about frame budgets; the Gemini path has no
+    # frames and covers the whole clip, so it does not apply there.
+    if (
+        not focused
+        and not youtube_native
+        and full_duration > 600
+        and detail not in ("transcript", "token-burner")
+    ):
         mins = int(full_duration // 60)
         print()
         print(
@@ -349,8 +443,34 @@ def main() -> int:
                 f"- `{frame['path']}` "
                 f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
             )
+    elif youtube_native:
+        print(
+            "_No frames — YouTube would not serve the media, so the visuals come from "
+            "the described timeline below instead._"
+        )
     else:
         print("_No frames extracted._")
+
+    if youtube_native:
+        print()
+        print("## Visual timeline")
+        print()
+        if visual_beats:
+            print(
+                f"> **These visuals were described by Gemini ({visual_model}), not seen by you.** "
+                "There are no frames to `Read` for this video — treat every line below as "
+                "secondhand reporting about the picture, and say so when you cite it. It can "
+                "miss things and it can be wrong in ways a frame would have settled."
+            )
+            print()
+            print("```")
+            print(format_beats(visual_beats))
+            print("```")
+        else:
+            print(
+                "_Gemini returned no visual timeline — proceed from the transcript alone "
+                "and tell the user the visual channel is missing._"
+            )
 
     print()
     print("## Transcript")
@@ -367,9 +487,9 @@ def main() -> int:
         print("```")
     elif detail == "transcript":
         print(
-            "_No transcript available at transcript detail. Captions were missing and Whisper was "
-            "unavailable or failed, so there is no visual fallback here. Re-run with "
-            "`--detail balanced` for frames._"
+            "_No transcript available at transcript detail. Captions were missing and "
+            "transcription was unavailable or failed, so there is no visual fallback here. "
+            "Re-run with `--detail balanced` for frames._"
         )
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
@@ -377,9 +497,9 @@ def main() -> int:
         setup_py = SCRIPT_DIR / "setup.py"
         print(
             "_No transcript available — proceed with frames only. "
-            "Captions were missing and the Whisper fallback was unavailable "
+            "Captions were missing and the transcription fallback was unavailable "
             "(no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            f"Run `python3 {setup_py}` to enable it, then re-run._"
         )
 
     print()
